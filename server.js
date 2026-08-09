@@ -1,8 +1,5 @@
 require('dotenv').config();
-console.log('CLIENT_ID length:', process.env.GOOGLE_CLIENT_ID?.length);
-console.log('CLIENT_ID:', JSON.stringify(process.env.GOOGLE_CLIENT_ID));
-console.log('CLIENT_SECRET length:', process.env.GOOGLE_CLIENT_SECRET?.length);
-console.log('CLIENT_SECRET:', JSON.stringify(process.env.GOOGLE_CLIENT_SECRET));
+
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 
@@ -39,6 +36,7 @@ const toUserResponse = (row) => ({
   firstName: row.first_name,
   lastName: row.last_name,
   email: row.email,
+  role: row.role,
   position: row.position,
   department: row.department,
   education: row.education,
@@ -60,6 +58,18 @@ const authMiddleware = (req, res, next) => {
     next();
   } catch (err) {
     return res.status(401).json({ message: 'Invalid or expired token.' });
+  }
+};
+
+const requireRole = (...allowedRoles) => async (req, res, next) => {
+  try {
+    const [rows] = await pool.query('SELECT role FROM users WHERE id = ?', [req.userId]);
+    if (rows.length === 0 || !allowedRoles.includes(rows[0].role)) {
+      return res.status(403).json({ message: 'You do not have permission to perform this action.' });
+    }
+    next();
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to verify role.' });
   }
 };
 
@@ -92,8 +102,8 @@ const findOrCreateOAuthUser = async (provider, profile) => {
   }
 
   const [result] = await pool.query(
-    `INSERT INTO users (first_name, last_name, email, profile_photo, oauth_provider, oauth_id)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO users (first_name, last_name, email, profile_photo, oauth_provider, oauth_id, role)
+     VALUES (?, ?, ?, ?, ?, ?, 'student')`,
     [firstName, lastName, email, photo, provider, oauthId]
   );
   const [rows] = await pool.query('SELECT * FROM users WHERE id = ?', [result.insertId]);
@@ -104,7 +114,7 @@ passport.use(new GoogleStrategy(
   {
     clientID: process.env.GOOGLE_CLIENT_ID,
     clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-    callbackURL: 'http://localhost:5000/api/auth/google/callback',
+    callbackURL: process.env.GOOGLE_CALLBACK_URL || 'http://localhost:5000/api/auth/google/callback',
   },
   async (accessToken, refreshToken, profile, done) => {
     try {
@@ -120,7 +130,7 @@ passport.use(new GoogleStrategy(
 
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { name, email, password } = req.body;
+    const { name, email, password, role } = req.body;
     if (!name || !email || !password) {
       return res.status(400).json({ message: 'All fields are required.' });
     }
@@ -131,9 +141,12 @@ app.post('/api/auth/signup', async (req, res) => {
     const [firstName, ...rest] = name.trim().split(' ');
     const lastName = rest.join(' ') || '';
     const passwordHash = await bcrypt.hash(password, 10);
+    const validRoles = ['student', 'manager', 'hr'];
+    const finalRole = validRoles.includes(role) ? role : 'student';
+
     const [result] = await pool.query(
-      'INSERT INTO users (first_name, last_name, email, password_hash) VALUES (?, ?, ?, ?)',
-      [firstName, lastName, email, passwordHash]
+      'INSERT INTO users (first_name, last_name, email, password_hash, role) VALUES (?, ?, ?, ?, ?)',
+      [firstName, lastName, email, passwordHash, finalRole]
     );
     const [rows] = await pool.query('SELECT * FROM users WHERE id = ?', [result.insertId]);
     const user = toUserResponse(rows[0]);
@@ -171,23 +184,14 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 
-app.get('/api/auth/google/callback', (req, res, next) => {
-  passport.authenticate('google', { session: false }, (err, user, info) => {
-    if (err) {
-      console.log('=== FULL OAUTH ERROR DUMP ===');
-      console.log('Error message:', err.message);
-      console.log('OAuth error body:', err.oauthError?.data || err.oauthError);
-      console.log('Full error object:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
-      return res.status(500).json({ message: 'OAuth failed', details: err.message });
-    }
-    if (!user) {
-      return res.status(401).json({ message: 'No user returned', info });
-    }
-    const userResponse = toUserResponse(user);
-    const token = jwt.sign({ id: userResponse.id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.redirect(`${process.env.FRONTEND_URL}/oauth-success?token=${token}&user=${encodeURIComponent(JSON.stringify(userResponse))}`);
-  })(req, res, next);
-});
+app.get('/api/auth/google/callback',
+  passport.authenticate('google', { session: false, failureRedirect: `${process.env.FRONTEND_URL}/auth` }),
+  (req, res) => {
+    const user = toUserResponse(req.user);
+    const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.redirect(`${process.env.FRONTEND_URL}/oauth-success?token=${token}&user=${encodeURIComponent(JSON.stringify(user))}`);
+  }
+);
 
 // ===================== PROFILE =====================
 
@@ -344,7 +348,7 @@ app.get('/api/teams', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/teams', authMiddleware, async (req, res) => {
+app.post('/api/teams', authMiddleware, requireRole('manager', 'hr', 'admin'), async (req, res) => {
   try {
     const { name, managerName, managerRole, managerAvatar } = req.body;
     if (!name || !managerName) {
@@ -368,7 +372,7 @@ app.post('/api/teams', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/teams/:teamId/members', authMiddleware, async (req, res) => {
+app.post('/api/teams/:teamId/members', authMiddleware, requireRole('manager', 'hr', 'admin'), async (req, res) => {
   try {
     const { teamId } = req.params;
     const { name, avatar, role, rating, feedback, completedTrainings, skills } = req.body;
@@ -404,7 +408,7 @@ app.post('/api/teams/:teamId/members', authMiddleware, async (req, res) => {
   }
 });
 
-app.put('/api/teams/members/:memberId/feedback', authMiddleware, async (req, res) => {
+app.put('/api/teams/members/:memberId/feedback', authMiddleware, requireRole('manager', 'hr', 'admin'), async (req, res) => {
   try {
     const { memberId } = req.params;
     const { rating, feedback } = req.body;
@@ -473,6 +477,441 @@ app.post('/api/chat-messages', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Failed to send message.' });
+  }
+});
+
+// ===================== EMPLOYEES (reuses users table) =====================
+
+app.get('/api/employees', authMiddleware, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, first_name, last_name, position, department, profile_photo,
+              experience, current_salary, performance_rating
+       FROM users`
+    );
+    const employees = rows.map((r) => ({
+      id: r.id,
+      name: `${r.first_name} ${r.last_name}`,
+      currentPosition: r.position || 'Unassigned',
+      currentSalary: parseFloat(r.current_salary) || 0,
+      avatar: r.profile_photo,
+      department: r.department || 'General',
+      experience: r.experience || 'N/A',
+      performance: parseFloat(r.performance_rating) || 0,
+    }));
+    res.json({ employees });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch employees.' });
+  }
+});
+
+// ===================== PROMOTION REQUESTS (HR reviews first, Manager confirms) =====================
+
+app.get('/api/promotion-requests', authMiddleware, async (req, res) => {
+  try {
+    const [requests] = await pool.query('SELECT * FROM promotion_requests ORDER BY created_at DESC');
+
+    const fullRequests = await Promise.all(
+      requests.map(async (r) => {
+        const [skills] = await pool.query(
+          'SELECT skill_name FROM promotion_request_skills WHERE promotion_request_id = ?',
+          [r.id]
+        );
+        const [certs] = await pool.query(
+          'SELECT certificate_name FROM promotion_request_certificates WHERE promotion_request_id = ?',
+          [r.id]
+        );
+
+        return {
+          id: r.id,
+          employeeId: r.user_id,
+          currentPosition: r.current_position,
+          requestedPosition: r.requested_position,
+          currentSalary: parseFloat(r.current_salary) || 0,
+          requestedSalary: parseFloat(r.requested_salary) || 0,
+          reason: r.justification,
+          submittedDate: r.submitted_date,
+          status: r.status,
+          achievements: r.achievements ? r.achievements.split('\n').filter(Boolean) : [],
+          certificates: certs.map((c) => c.certificate_name),
+          skills: skills.map((s) => s.skill_name),
+          hrApproval: r.hr_approved !== null
+            ? {
+                approved: !!r.hr_approved,
+                approvedBy: r.hr_approved_by,
+                approvedDate: r.hr_approved_date,
+                comments: r.hr_comments,
+              }
+            : null,
+          managerApproval: r.manager_approved !== null
+            ? {
+                approved: !!r.manager_approved,
+                approvedBy: r.manager_approved_by,
+                approvedDate: r.manager_approved_date,
+                approvedPosition: r.manager_approved_position,
+                approvedSalary: parseFloat(r.manager_approved_salary) || 0,
+                approvedRating: parseFloat(r.manager_rating) || 0,
+                comments: r.manager_comments,
+              }
+            : null,
+          approvedPosition: r.manager_approved_position,
+          approvedSalary: parseFloat(r.manager_approved_salary) || 0,
+          approvedRating: parseFloat(r.manager_rating) || 0,
+        };
+      })
+    );
+
+    res.json({ requests: fullRequests });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch promotion requests.' });
+  }
+});
+
+app.post('/api/promotion-requests', authMiddleware, async (req, res) => {
+  try {
+    const {
+      currentPosition, requestedPosition, department,
+      currentSalary, requestedSalary, justification,
+      achievements, timeline, skills
+    } = req.body;
+
+    if (!requestedPosition || !justification) {
+      return res.status(400).json({ message: 'Requested position and justification are required.' });
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO promotion_requests
+        (user_id, current_position, requested_position, department, current_salary, requested_salary, justification, achievements, timeline)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [req.userId, currentPosition || '', requestedPosition, department || null, currentSalary || 0, requestedSalary || 0, justification, achievements || '', timeline || null]
+    );
+
+    const requestId = result.insertId;
+
+    if (Array.isArray(skills) && skills.length > 0) {
+      const skillValues = skills.map((s) => [requestId, s]);
+      await pool.query('INSERT INTO promotion_request_skills (promotion_request_id, skill_name) VALUES ?', [skillValues]);
+    }
+
+    res.status(201).json({ id: requestId, message: 'Promotion request submitted.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to submit promotion request.' });
+  }
+});
+
+app.put('/api/promotion-requests/:id/hr-review', authMiddleware, requireRole('hr', 'admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { comments } = req.body;
+
+    await pool.query(
+      `UPDATE promotion_requests SET
+        status = 'on-hold',
+        hr_approved = TRUE,
+        hr_approved_by = 'HR Director',
+        hr_approved_date = CURRENT_DATE,
+        hr_comments = ?
+       WHERE id = ? AND status = 'pending'`,
+      [comments, id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to review request.' });
+  }
+});
+
+app.put('/api/promotion-requests/:id/manager-final-approve', authMiddleware, requireRole('manager', 'admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { approvedPosition, approvedSalary, approvedRating, comments } = req.body;
+
+    const [rows] = await pool.query('SELECT * FROM promotion_requests WHERE id = ?', [id]);
+    if (rows.length === 0) return res.status(404).json({ message: 'Request not found.' });
+    const request = rows[0];
+
+    await pool.query(
+      `UPDATE promotion_requests SET
+        status = 'approved',
+        manager_approved = TRUE,
+        manager_approved_by = 'Manager',
+        manager_approved_date = CURRENT_DATE,
+        manager_approved_position = ?,
+        manager_approved_salary = ?,
+        manager_rating = ?,
+        manager_comments = ?
+       WHERE id = ? AND status = 'on-hold'`,
+      [approvedPosition, approvedSalary, approvedRating, comments, id]
+    );
+
+    await pool.query(
+      `UPDATE users SET position = ?, current_salary = ?, performance_rating = ? WHERE id = ?`,
+      [approvedPosition, approvedSalary, approvedRating, request.user_id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to finalize approval.' });
+  }
+});
+
+app.put('/api/promotion-requests/:id/reject', authMiddleware, requireRole('hr', 'manager', 'admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { comments } = req.body;
+    const [userRows] = await pool.query('SELECT role FROM users WHERE id = ?', [req.userId]);
+    const rejectorRole = userRows[0]?.role;
+
+    if (rejectorRole === 'hr') {
+      await pool.query(
+        `UPDATE promotion_requests SET status = 'rejected', hr_approved = FALSE, hr_approved_by = 'HR Director', hr_approved_date = CURRENT_DATE, hr_comments = ? WHERE id = ?`,
+        [comments || null, id]
+      );
+    } else {
+      await pool.query(
+        `UPDATE promotion_requests SET status = 'rejected', manager_approved = FALSE, manager_approved_by = 'Manager', manager_approved_date = CURRENT_DATE, manager_comments = ? WHERE id = ?`,
+        [comments || null, id]
+      );
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to reject request.' });
+  }
+});
+
+// ===================== FORMATIONS =====================
+
+app.get('/api/formations', authMiddleware, async (req, res) => {
+  try {
+    const [formations] = await pool.query('SELECT * FROM formations ORDER BY created_at DESC');
+    const full = await Promise.all(
+      formations.map(async (f) => {
+        const [skills] = await pool.query('SELECT skill_name FROM formation_skills WHERE formation_id = ?', [f.id]);
+        return {
+          id: f.id,
+          title: f.title,
+          description: f.description,
+          duration: f.duration,
+          instructor: f.instructor,
+          level: f.level,
+          category: f.category,
+          available: !!f.available,
+          iconUrl: f.icon_url,
+          skills: skills.map((s) => s.skill_name),
+        };
+      })
+    );
+    res.json({ formations: full });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch formations.' });
+  }
+});
+
+app.post('/api/formations', authMiddleware, requireRole('manager', 'hr', 'admin'), async (req, res) => {
+  try {
+    const { title, description, duration, instructor, level, category, iconUrl, skills } = req.body;
+    if (!title) return res.status(400).json({ message: 'Title is required.' });
+
+    const [result] = await pool.query(
+      `INSERT INTO formations (title, description, duration, instructor, level, category, icon_url)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [title, description || '', duration || '', instructor || '', level || 'Intermédiaire', category || '', iconUrl || null]
+    );
+
+    const formationId = result.insertId;
+    if (Array.isArray(skills) && skills.length > 0) {
+      const values = skills.map((s) => [formationId, s]);
+      await pool.query('INSERT INTO formation_skills (formation_id, skill_name) VALUES ?', [values]);
+    }
+
+    res.status(201).json({ id: formationId, message: 'Formation created.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to create formation.' });
+  }
+});
+
+app.post('/api/formations/:formationId/assign', authMiddleware, requireRole('manager', 'hr', 'admin'), async (req, res) => {
+  try {
+    const { formationId } = req.params;
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ message: 'userId is required.' });
+
+    const [existing] = await pool.query(
+      'SELECT id FROM user_formation_progress WHERE user_id = ? AND formation_id = ?',
+      [userId, formationId]
+    );
+    if (existing.length > 0) {
+      return res.status(409).json({ message: 'This employee is already assigned to this formation.' });
+    }
+
+    await pool.query(
+      `INSERT INTO user_formation_progress (user_id, formation_id, status, progress, started_at)
+       VALUES (?, ?, 'En cours', 0, CURRENT_DATE)`,
+      [userId, formationId]
+    );
+
+    res.status(201).json({ message: 'Formation assigned successfully.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to assign formation.' });
+  }
+});
+
+app.get('/api/my-formations', authMiddleware, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT ufp.*, f.title, f.description, f.duration, f.instructor, f.level, f.icon_url
+       FROM user_formation_progress ufp
+       JOIN formations f ON f.id = ufp.formation_id
+       WHERE ufp.user_id = ?`,
+      [req.userId]
+    );
+    const myFormations = rows.map((r) => ({
+      id: r.id,
+      formationId: r.formation_id,
+      title: r.title,
+      description: r.description,
+      duration: r.duration,
+      instructor: r.instructor,
+      level: r.level,
+      iconUrl: r.icon_url,
+      status: r.status,
+      progress: r.progress,
+      startedAt: r.started_at,
+    }));
+    res.json({ formations: myFormations });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch your formations.' });
+  }
+});
+
+app.put('/api/my-formations/:id/progress', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { progress } = req.body;
+    const status = progress >= 100 ? 'Terminée' : 'En cours';
+
+    await pool.query(
+      'UPDATE user_formation_progress SET progress = ?, status = ? WHERE id = ? AND user_id = ?',
+      [progress, status, id, req.userId]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to update progress.' });
+  }
+});
+
+// ===================== FORMATION ENROLLMENT REQUESTS (HR reviews first, Manager confirms) =====================
+
+app.post('/api/formation-requests', authMiddleware, async (req, res) => {
+  try {
+    const { formationId, motivation } = req.body;
+    if (!formationId || !motivation?.trim()) {
+      return res.status(400).json({ message: 'Formation and motivation are required.' });
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO formation_requests (formation_id, user_id, motivation, status)
+       VALUES (?, ?, ?, 'pending')`,
+      [formationId, req.userId, motivation.trim()]
+    );
+
+    res.status(201).json({ id: result.insertId, message: 'Request submitted.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to submit request.' });
+  }
+});
+
+app.get('/api/formation-requests', authMiddleware, requireRole('manager', 'hr', 'admin'), async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT fr.*, f.title AS formation_title, u.first_name, u.last_name, u.profile_photo
+       FROM formation_requests fr
+       JOIN formations f ON f.id = fr.formation_id
+       JOIN users u ON u.id = fr.user_id
+       ORDER BY fr.requested_at DESC`
+    );
+    const requests = rows.map((r) => ({
+      id: r.id,
+      formationId: r.formation_id,
+      formationTitle: r.formation_title,
+      userId: r.user_id,
+      employeeName: `${r.first_name} ${r.last_name}`,
+      employeeAvatar: r.profile_photo,
+      motivation: r.motivation,
+      status: r.status,
+      requestedAt: r.requested_at,
+    }));
+    res.json({ requests });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch formation requests.' });
+  }
+});
+
+app.put('/api/formation-requests/:id/hr-review', authMiddleware, requireRole('hr', 'admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(
+      `UPDATE formation_requests SET status = 'on-hold' WHERE id = ? AND status = 'pending'`,
+      [id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to review request.' });
+  }
+});
+
+app.put('/api/formation-requests/:id/manager-confirm', authMiddleware, requireRole('manager', 'admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [rows] = await pool.query('SELECT * FROM formation_requests WHERE id = ? AND status = ?', [id, 'on-hold']);
+    if (rows.length === 0) return res.status(404).json({ message: 'Request not found or not ready for confirmation.' });
+    const request = rows[0];
+
+    await pool.query(`UPDATE formation_requests SET status = 'approved' WHERE id = ?`, [id]);
+
+    const [existing] = await pool.query(
+      'SELECT id FROM user_formation_progress WHERE user_id = ? AND formation_id = ?',
+      [request.user_id, request.formation_id]
+    );
+    if (existing.length === 0) {
+      await pool.query(
+        `INSERT INTO user_formation_progress (user_id, formation_id, status, progress, started_at)
+         VALUES (?, ?, 'En cours', 0, CURRENT_DATE)`,
+        [request.user_id, request.formation_id]
+      );
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to confirm request.' });
+  }
+});
+
+app.put('/api/formation-requests/:id/reject', authMiddleware, requireRole('manager', 'hr', 'admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(`UPDATE formation_requests SET status = 'rejected' WHERE id = ?`, [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to reject request.' });
   }
 });
 
