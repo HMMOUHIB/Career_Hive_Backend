@@ -36,6 +36,11 @@ const pool = mysql.createPool({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
 });
+console.log('DB CONFIG CHECK:');
+console.log('  HOST:', JSON.stringify(process.env.DB_HOST));
+console.log('  PORT:', JSON.stringify(process.env.DB_PORT));
+console.log('  USER:', JSON.stringify(process.env.DB_USER));
+console.log('  DATABASE:', JSON.stringify(process.env.DB_NAME));
 
 const toUserResponse = (row) => ({
   id: row.id,
