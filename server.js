@@ -13,7 +13,13 @@ const session = require('express-session');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:3000',
+    process.env.FRONTEND_URL,
+  ],
+  credentials: true,
+}));
 app.use(express.json({ limit: '10mb' }));
 
 app.use(session({
