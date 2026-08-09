@@ -14,12 +14,11 @@ const GoogleStrategy = require('passport-google-oauth20').Strategy;
 
 const app = express();
 app.use(cors({
-  origin: [
-    'http://localhost:3000',
-    process.env.FRONTEND_URL,
-  ],
+  origin: true,
   credentials: true,
 }));
+
+console.log('CORS configured - FRONTEND_URL env value:', process.env.FRONTEND_URL);
 app.use(express.json({ limit: '10mb' }));
 
 app.use(session({
