@@ -3,6 +3,7 @@ require('dotenv').config();
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 
+const crypto = require('crypto');
 const express = require('express');
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
@@ -178,7 +179,7 @@ app.post('/api/auth/login', async (req, res) => {
     const [rows] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
     if (rows.length === 0) return res.status(401).json({ message: 'Invalid email or password.' });
     if (!rows[0].password_hash) {
-      return res.status(401).json({ message: 'This account uses social sign-in. Please continue with Google.' });
+      return res.status(401).json({ message: 'This account uses social sign-in. Please continue with Google, LinkedIn or GitHub.' });
     }
     const match = await bcrypt.compare(password, rows[0].password_hash);
     if (!match) return res.status(401).json({ message: 'Invalid email or password.' });
@@ -191,6 +192,17 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM users WHERE id = ?', [req.userId]);
+    if (rows.length === 0) return res.status(404).json({ message: 'User not found.' });
+    res.json({ user: toUserResponse(rows[0]) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to load user.' });
+  }
+});
+
 // ===================== GOOGLE OAUTH ROUTES =====================
 
 app.get('/api/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
@@ -200,9 +212,151 @@ app.get('/api/auth/google/callback',
   (req, res) => {
     const user = toUserResponse(req.user);
     const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.redirect(`${process.env.FRONTEND_URL}/oauth-success?token=${token}&user=${encodeURIComponent(JSON.stringify(user))}`);
+    // Only the token goes in the URL; the frontend loads the user via /api/auth/me
+    // (profile photos are stored as base64 and would make the URL far too long)
+    res.redirect(`${process.env.FRONTEND_URL}/oauth-success?token=${token}`);
   }
 );
+
+// ===================== LINKEDIN OAUTH ROUTES (OpenID Connect) =====================
+
+const LINKEDIN_CALLBACK_URL = process.env.LINKEDIN_CALLBACK_URL || 'http://localhost:5000/api/auth/linkedin/callback';
+
+app.get('/api/auth/linkedin', (req, res) => {
+  const state = crypto.randomBytes(16).toString('hex');
+  req.session.linkedinState = state;
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: process.env.LINKEDIN_CLIENT_ID,
+    redirect_uri: LINKEDIN_CALLBACK_URL,
+    scope: 'openid profile email',
+    state,
+  });
+  req.session.save(() => res.redirect(`https://www.linkedin.com/oauth/v2/authorization?${params}`));
+});
+
+app.get('/api/auth/linkedin/callback', async (req, res) => {
+  const failureRedirect = `${process.env.FRONTEND_URL}/auth`;
+  try {
+    const { code, state, error } = req.query;
+    const expectedState = req.session.linkedinState;
+    delete req.session.linkedinState;
+    if (error || !code || !state || state !== expectedState) {
+      return res.redirect(failureRedirect);
+    }
+
+    const tokenRes = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: LINKEDIN_CALLBACK_URL,
+        client_id: process.env.LINKEDIN_CLIENT_ID,
+        client_secret: process.env.LINKEDIN_CLIENT_SECRET,
+      }),
+    });
+    if (!tokenRes.ok) throw new Error(`LinkedIn token exchange failed: ${await tokenRes.text()}`);
+    const { access_token } = await tokenRes.json();
+
+    const infoRes = await fetch('https://api.linkedin.com/v2/userinfo', {
+      headers: { Authorization: `Bearer ${access_token}` },
+    });
+    if (!infoRes.ok) throw new Error(`LinkedIn userinfo failed: ${await infoRes.text()}`);
+    const info = await infoRes.json();
+
+    // Shape it like a passport profile so findOrCreateOAuthUser can be reused
+    const profile = {
+      id: info.sub,
+      displayName: info.name || [info.given_name, info.family_name].filter(Boolean).join(' '),
+      emails: info.email && info.email_verified !== false ? [{ value: info.email }] : [],
+      photos: info.picture ? [{ value: info.picture }] : [],
+    };
+
+    const user = toUserResponse(await findOrCreateOAuthUser('linkedin', profile));
+    const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    // Only the token goes in the URL; the frontend loads the user via /api/auth/me
+    // (profile photos are stored as base64 and would make the URL far too long)
+    res.redirect(`${process.env.FRONTEND_URL}/oauth-success?token=${token}`);
+  } catch (err) {
+    console.error(err);
+    res.redirect(failureRedirect);
+  }
+});
+
+// ===================== GITHUB OAUTH ROUTES =====================
+
+const GITHUB_CALLBACK_URL = process.env.GITHUB_CALLBACK_URL || 'http://localhost:5000/api/auth/github/callback';
+
+app.get('/api/auth/github', (req, res) => {
+  const state = crypto.randomBytes(16).toString('hex');
+  req.session.githubState = state;
+  const params = new URLSearchParams({
+    client_id: process.env.GITHUB_CLIENT_ID,
+    redirect_uri: GITHUB_CALLBACK_URL,
+    scope: 'read:user user:email',
+    state,
+  });
+  req.session.save(() => res.redirect(`https://github.com/login/oauth/authorize?${params}`));
+});
+
+app.get('/api/auth/github/callback', async (req, res) => {
+  const failureRedirect = `${process.env.FRONTEND_URL}/auth`;
+  try {
+    const { code, state, error } = req.query;
+    const expectedState = req.session.githubState;
+    delete req.session.githubState;
+    if (error || !code || !state || state !== expectedState) {
+      return res.redirect(failureRedirect);
+    }
+
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        client_id: process.env.GITHUB_CLIENT_ID,
+        client_secret: process.env.GITHUB_CLIENT_SECRET,
+        code,
+        redirect_uri: GITHUB_CALLBACK_URL,
+      }),
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) throw new Error(`GitHub token exchange failed: ${JSON.stringify(tokenData)}`);
+
+    const ghHeaders = {
+      Authorization: `Bearer ${tokenData.access_token}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'CareerHive',
+    };
+    const info = await (await fetch('https://api.github.com/user', { headers: ghHeaders })).json();
+
+    // The public profile email is often hidden, so ask for the verified primary one
+    let email = info.email;
+    const emailsRes = await fetch('https://api.github.com/user/emails', { headers: ghHeaders });
+    if (emailsRes.ok) {
+      const emails = await emailsRes.json();
+      const primary = emails.find((e) => e.primary && e.verified) || emails.find((e) => e.verified);
+      if (primary) email = primary.email;
+    }
+
+    // Shape it like a passport profile so findOrCreateOAuthUser can be reused
+    const profile = {
+      id: String(info.id),
+      displayName: info.name || info.login,
+      emails: email ? [{ value: email }] : [],
+      photos: info.avatar_url ? [{ value: info.avatar_url }] : [],
+    };
+
+    const user = toUserResponse(await findOrCreateOAuthUser('github', profile));
+    const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    // Only the token goes in the URL; the frontend loads the user via /api/auth/me
+    // (profile photos are stored as base64 and would make the URL far too long)
+    res.redirect(`${process.env.FRONTEND_URL}/oauth-success?token=${token}`);
+  } catch (err) {
+    console.error(err);
+    res.redirect(failureRedirect);
+  }
+});
 
 // ===================== PROFILE =====================
 
