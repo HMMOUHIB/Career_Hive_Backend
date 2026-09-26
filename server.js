@@ -36,6 +36,10 @@ const pool = mysql.createPool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
+  // Hosted MySQL (e.g. Aiven) requires TLS; set DB_SSL=true and paste the provider's CA cert in DB_CA_CERT
+  ssl: process.env.DB_SSL === 'true'
+    ? { ca: process.env.DB_CA_CERT?.replace(/\\n/g, '\n'), rejectUnauthorized: !!process.env.DB_CA_CERT }
+    : undefined,
 });
 console.log('DB CONFIG CHECK:');
 console.log('  HOST:', JSON.stringify(process.env.DB_HOST));
