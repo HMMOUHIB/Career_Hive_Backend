@@ -362,6 +362,282 @@ app.get('/api/auth/github/callback', async (req, res) => {
   }
 });
 
+// ===================== DASHBOARD =====================
+// One role-aware payload for the home page. Everyone gets their own career progress;
+// manager / hr / admin also get organisation analytics and the review queue waiting on them.
+// Aggregation happens in SQL so the page needs a single request.
+
+// HR reviews first ('pending'), the manager confirms after ('on-hold'); admin sees both
+const REVIEW_STATUSES = { hr: ['pending'], manager: ['on-hold'], admin: ['pending', 'on-hold'] };
+
+// Profile photos are stored as base64; only return real URLs so list payloads stay small
+const photoUrl = (photo) => (photo && /^https?:\/\//.test(photo) ? photo : null);
+const fullName = (row) => [row.first_name, row.last_name].filter(Boolean).join(' ').trim();
+const countBy = (rows, keys) =>
+  Object.fromEntries(keys.map((k) => [k, Number(rows.find((r) => r.status === k)?.count || 0)]));
+
+const toPromotionSummary = (r) => ({
+  id: r.id,
+  status: r.status,
+  currentPosition: r.current_position,
+  requestedPosition: r.requested_position,
+  submittedDate: r.submitted_date,
+  hrApproval: r.hr_approved !== null ? { approved: !!r.hr_approved, comments: r.hr_comments } : null,
+  managerApproval: r.manager_approved !== null
+    ? { approved: !!r.manager_approved, comments: r.manager_comments, approvedPosition: r.manager_approved_position }
+    : null,
+});
+
+const toFormationCard = (f) => ({
+  id: f.id,
+  title: f.title,
+  description: f.description,
+  level: f.level,
+  category: f.category,
+  iconUrl: f.icon_url,
+  enrolled: Number(f.enrolled || 0),
+  completed: Number(f.completed || 0),
+  avgProgress: Number(f.avgProgress || 0),
+  skills: [],
+});
+
+const attachFormationSkills = async (cards) => {
+  if (cards.length === 0) return cards;
+  const [rows] = await pool.query(
+    'SELECT formation_id, skill_name FROM formation_skills WHERE formation_id IN (?)',
+    [cards.map((c) => c.id)]
+  );
+  return cards.map((c) => ({
+    ...c,
+    skills: rows.filter((r) => r.formation_id === c.id).map((r) => r.skill_name),
+  }));
+};
+
+app.get('/api/dashboard', authMiddleware, async (req, res) => {
+  try {
+    const [[me]] = await pool.query('SELECT id, role FROM users WHERE id = ?', [req.userId]);
+    if (!me) return res.status(404).json({ message: 'User not found.' });
+    const reviewStatuses = REVIEW_STATUSES[me.role];
+    const isStaff = !!reviewStatuses;
+
+    const [
+      [[myCounts]],
+      [myFormations],
+      [recommendedRows],
+      [latestPromotion],
+      [myFormationRequests],
+      [myTeam],
+    ] = await Promise.all([
+      pool.query(
+        `SELECT (SELECT COUNT(*) FROM skills WHERE user_id = ?) AS skills,
+                (SELECT COUNT(*) FROM certificates WHERE user_id = ?) AS certificates`,
+        [me.id, me.id]
+      ),
+      pool.query(
+        `SELECT ufp.id, ufp.formation_id, ufp.status, ufp.progress, ufp.started_at,
+                f.title, f.level, f.duration, f.instructor, f.icon_url
+         FROM user_formation_progress ufp
+         JOIN formations f ON f.id = ufp.formation_id
+         WHERE ufp.user_id = ?
+         ORDER BY ufp.progress >= 100, ufp.started_at DESC`,
+        [me.id]
+      ),
+      pool.query(
+        `SELECT f.id, f.title, f.description, f.level, f.category, f.icon_url,
+                (SELECT COUNT(*) FROM user_formation_progress p WHERE p.formation_id = f.id) AS enrolled
+         FROM formations f
+         WHERE f.available = TRUE
+           AND f.id NOT IN (SELECT formation_id FROM user_formation_progress WHERE user_id = ?)
+         ORDER BY enrolled DESC, f.created_at DESC
+         LIMIT 3`,
+        [me.id]
+      ),
+      pool.query('SELECT * FROM promotion_requests WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', [me.id]),
+      pool.query(
+        `SELECT fr.id, fr.status, fr.requested_at, f.title
+         FROM formation_requests fr JOIN formations f ON f.id = fr.formation_id
+         WHERE fr.user_id = ? ORDER BY fr.requested_at DESC LIMIT 3`,
+        [me.id]
+      ),
+      pool.query(
+        `SELECT t.id, t.name, t.manager_name, t.manager_role, t.manager_avatar, tm.rating, tm.feedback,
+                (SELECT COUNT(*) FROM team_members x WHERE x.team_id = t.id) AS members
+         FROM team_members tm JOIN teams t ON t.id = tm.team_id
+         WHERE tm.user_id = ? LIMIT 1`,
+        [me.id]
+      ),
+    ]);
+
+    const completed = myFormations.filter((f) => f.progress >= 100).length;
+    const avgProgress = myFormations.length
+      ? Math.round(myFormations.reduce((sum, f) => sum + f.progress, 0) / myFormations.length)
+      : 0;
+    const team = myTeam[0];
+
+    const payload = {
+      role: me.role,
+      me: {
+        skills: Number(myCounts.skills),
+        certificates: Number(myCounts.certificates),
+        learning: {
+          total: myFormations.length,
+          active: myFormations.length - completed,
+          completed,
+          avgProgress,
+        },
+        formations: myFormations.slice(0, 4).map((f) => ({
+          id: f.id,
+          formationId: f.formation_id,
+          title: f.title,
+          level: f.level,
+          duration: f.duration,
+          instructor: f.instructor,
+          iconUrl: f.icon_url,
+          status: f.status,
+          progress: f.progress,
+          startedAt: f.started_at,
+        })),
+        recommended: await attachFormationSkills(recommendedRows.map(toFormationCard)),
+        promotion: latestPromotion[0] ? toPromotionSummary(latestPromotion[0]) : null,
+        formationRequests: myFormationRequests.map((r) => ({
+          id: r.id,
+          title: r.title,
+          status: r.status,
+          requestedAt: r.requested_at,
+        })),
+        team: team
+          ? {
+              id: team.id,
+              name: team.name,
+              members: Number(team.members),
+              manager: { name: team.manager_name, role: team.manager_role, avatar: photoUrl(team.manager_avatar) },
+              rating: team.rating !== null ? Number(team.rating) : null,
+              feedback: team.feedback,
+            }
+          : null,
+      },
+      org: null,
+    };
+
+    if (isStaff) {
+      const [
+        [[totals]],
+        [usersByRole],
+        [popularRows],
+        [promotionPipeline],
+        [formationPipeline],
+        [topSkills],
+        [departments],
+        [promotionQueue],
+        [formationQueue],
+      ] = await Promise.all([
+        pool.query(
+          `SELECT (SELECT COUNT(*) FROM users) AS users,
+                  (SELECT COUNT(*) FROM users WHERE role = 'student') AS employees,
+                  (SELECT COUNT(*) FROM teams) AS teams,
+                  (SELECT COUNT(*) FROM team_members) AS teamMembers,
+                  (SELECT COUNT(*) FROM certificates) AS certificates,
+                  (SELECT COUNT(*) FROM formations) AS catalog,
+                  (SELECT COUNT(*) FROM user_formation_progress) AS enrollments,
+                  (SELECT COUNT(*) FROM user_formation_progress WHERE progress >= 100) AS completedEnrollments,
+                  (SELECT COALESCE(ROUND(AVG(progress)), 0) FROM user_formation_progress) AS avgProgress,
+                  (SELECT ROUND(AVG(rating), 1) FROM team_members WHERE rating IS NOT NULL) AS avgRating,
+                  (SELECT COUNT(*) FROM promotion_requests WHERE status IN (?)) AS promotionQueue,
+                  (SELECT COUNT(*) FROM formation_requests WHERE status IN (?)) AS formationQueue`,
+          [reviewStatuses, reviewStatuses]
+        ),
+        pool.query('SELECT role, COUNT(*) AS count FROM users GROUP BY role'),
+        pool.query(
+          `SELECT f.id, f.title, f.description, f.level, f.category, f.icon_url,
+                  COUNT(p.id) AS enrolled,
+                  COALESCE(SUM(p.progress >= 100), 0) AS completed,
+                  COALESCE(ROUND(AVG(p.progress)), 0) AS avgProgress
+           FROM formations f
+           LEFT JOIN user_formation_progress p ON p.formation_id = f.id
+           GROUP BY f.id
+           ORDER BY enrolled DESC, f.created_at DESC
+           LIMIT 3`
+        ),
+        pool.query('SELECT status, COUNT(*) AS count FROM promotion_requests GROUP BY status'),
+        pool.query('SELECT status, COUNT(*) AS count FROM formation_requests GROUP BY status'),
+        pool.query(
+          `SELECT skill_name AS name, COUNT(*) AS count
+           FROM (SELECT skill_name FROM skills UNION ALL SELECT skill_name FROM team_member_skills) s
+           GROUP BY skill_name
+           ORDER BY count DESC, name
+           LIMIT 6`
+        ),
+        pool.query(
+          `SELECT COALESCE(NULLIF(TRIM(department), ''), 'Unassigned') AS dept, COUNT(*) AS count
+           FROM users WHERE role = 'student'
+           GROUP BY dept ORDER BY count DESC LIMIT 6`
+        ),
+        pool.query(
+          `SELECT pr.id, pr.status, pr.current_position, pr.requested_position, pr.submitted_date,
+                  u.first_name, u.last_name, u.profile_photo
+           FROM promotion_requests pr JOIN users u ON u.id = pr.user_id
+           WHERE pr.status IN (?)
+           ORDER BY pr.submitted_date ASC, pr.id ASC
+           LIMIT 5`,
+          [reviewStatuses]
+        ),
+        pool.query(
+          `SELECT fr.id, fr.status, fr.requested_at, f.title AS formation_title,
+                  u.first_name, u.last_name, u.profile_photo
+           FROM formation_requests fr
+           JOIN formations f ON f.id = fr.formation_id
+           JOIN users u ON u.id = fr.user_id
+           WHERE fr.status IN (?)
+           ORDER BY fr.requested_at ASC
+           LIMIT 5`,
+          [reviewStatuses]
+        ),
+      ]);
+
+      payload.org = {
+        totals: Object.fromEntries(
+          Object.entries(totals).map(([k, v]) => [k, v === null ? null : Number(v)])
+        ),
+        usersByRole: Object.fromEntries(
+          ['student', 'manager', 'hr', 'admin'].map((r) => [
+            r,
+            Number(usersByRole.find((row) => row.role === r)?.count || 0),
+          ])
+        ),
+        popularFormations: await attachFormationSkills(popularRows.map(toFormationCard)),
+        promotionPipeline: countBy(promotionPipeline, ['pending', 'on-hold', 'approved', 'rejected']),
+        formationPipeline: countBy(formationPipeline, ['pending', 'on-hold', 'approved', 'rejected']),
+        topSkills: topSkills.map((s) => ({ name: s.name, count: Number(s.count) })),
+        departments: departments.map((d) => ({ name: d.dept, count: Number(d.count) })),
+        queue: {
+          promotions: promotionQueue.map((r) => ({
+            id: r.id,
+            status: r.status,
+            employee: fullName(r),
+            photo: photoUrl(r.profile_photo),
+            currentPosition: r.current_position,
+            requestedPosition: r.requested_position,
+            date: r.submitted_date,
+          })),
+          formations: formationQueue.map((r) => ({
+            id: r.id,
+            status: r.status,
+            employee: fullName(r),
+            photo: photoUrl(r.profile_photo),
+            formation: r.formation_title,
+            date: r.requested_at,
+          })),
+        },
+      };
+    }
+
+    res.json(payload);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to load dashboard.' });
+  }
+});
+
 // ===================== PROFILE =====================
 
 app.put('/api/users/:id', authMiddleware, async (req, res) => {
